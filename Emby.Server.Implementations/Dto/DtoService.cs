@@ -160,10 +160,17 @@ namespace Emby.Server.Implementations.Dto
             List<(BaseItem, BaseItemDto)>? programTuples = null;
             List<(BaseItemDto, LiveTvChannel)>? channelTuples = null;
 
+            // Cache
+            Dictionary<Guid, List<(PersonInfo Info, Person? Entity)>>? peopleCache = null;
+            if (options.ContainsField(ItemFields.People))
+            {
+                peopleCache = LoadPeopleForItems(accessibleItems, user);
+            }
+
             for (int index = 0; index < accessibleItems.Count; index++)
             {
                 var item = accessibleItems[index];
-                var dto = GetBaseItemDtoInternal(item, options, user, owner);
+                var dto = GetBaseItemDtoInternal(item, options, user, owner, peopleCache);
 
                 if (item is LiveTvChannel tvChannel)
                 {
@@ -215,7 +222,7 @@ namespace Emby.Server.Implementations.Dto
             return dto;
         }
 
-        private BaseItemDto GetBaseItemDtoInternal(BaseItem item, DtoOptions options, User? user = null, BaseItem? owner = null)
+        private BaseItemDto GetBaseItemDtoInternal(BaseItem item, DtoOptions options, User? user = null, BaseItem? owner = null, Dictionary<Guid, List<(PersonInfo Info, Person? Entity)>>? peopleCache = null)
         {
             var dto = new BaseItemDto
             {
@@ -229,7 +236,7 @@ namespace Emby.Server.Implementations.Dto
 
             if (options.ContainsField(ItemFields.People))
             {
-                AttachPeople(dto, item, user);
+                AttachPeople(dto, item, user, peopleCache);
             }
 
             if (options.ContainsField(ItemFields.PrimaryImageAspectRatio))
@@ -602,70 +609,27 @@ namespace Emby.Server.Implementations.Dto
         /// <param name="dto">The dto.</param>
         /// <param name="item">The item.</param>
         /// <param name="user">The requesting user.</param>
-        private void AttachPeople(BaseItemDto dto, BaseItem item, User? user = null)
+        /// <param name="peopleCache">Optional pre-loaded cache of Person entities.</param>
+        private void AttachPeople(BaseItemDto dto, BaseItem item, User? user = null, Dictionary<Guid, List<(PersonInfo Info, Person? Entity)>>? peopleCache = null)
         {
-            // Ordering by person type to ensure actors and artists are at the front.
-            // This is taking advantage of the fact that they both begin with A
-            // This should be improved in the future
-            var people = _libraryManager.GetPeople(item).OrderBy(i => i.SortOrder ?? int.MaxValue)
-                .ThenBy(i =>
-                {
-                    if (i.IsType(PersonKind.Actor))
-                    {
-                        return 0;
-                    }
+            List<(PersonInfo Info, Person? Entity)> peopleWithInfo;
 
-                    if (i.IsType(PersonKind.GuestStar))
-                    {
-                        return 1;
-                    }
-
-                    if (i.IsType(PersonKind.Director))
-                    {
-                        return 2;
-                    }
-
-                    if (i.IsType(PersonKind.Writer))
-                    {
-                        return 3;
-                    }
-
-                    if (i.IsType(PersonKind.Producer))
-                    {
-                        return 4;
-                    }
-
-                    if (i.IsType(PersonKind.Composer))
-                    {
-                        return 4;
-                    }
-
-                    return 10;
-                })
-                .ToList();
+            if (peopleCache is not null && peopleCache.TryGetValue(item.Id, out var cached))
+            {
+                peopleWithInfo = cached;
+            }
+            else
+            {
+                var singleItemCache = LoadPeopleForItems(new[] { item }, user);
+                peopleWithInfo = singleItemCache[item.Id];
+            }
 
             var list = new List<BaseItemPerson>();
 
-            Dictionary<string, Person> dictionary = people.Select(p => p.Name)
-                .Distinct(StringComparer.OrdinalIgnoreCase).Select(c =>
-                {
-                    try
-                    {
-                        return _libraryManager.GetPerson(c);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error getting person {Name}", c);
-                        return null;
-                    }
-                }).Where(i => i is not null)
-                .Where(i => user is null || i!.IsVisible(user))
-                .DistinctBy(x => x!.Name, StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(i => i!.Name, StringComparer.OrdinalIgnoreCase)!; // null values got filtered out
-
-            for (var i = 0; i < people.Count; i++)
+            foreach (var personWithInfo in peopleWithInfo)
             {
-                var person = people[i];
+                var person = personWithInfo.Info;
+                var entity = personWithInfo.Entity;
 
                 var baseItemPerson = new BaseItemPerson
                 {
@@ -674,7 +638,7 @@ namespace Emby.Server.Implementations.Dto
                     Type = person.Type
                 };
 
-                if (dictionary.TryGetValue(person.Name, out Person? entity))
+                if (entity is not null)
                 {
                     baseItemPerson.PrimaryImageTag = GetTagAndFillBlurhash(dto, entity, ImageType.Primary);
                     baseItemPerson.Id = entity.Id;
@@ -703,6 +667,88 @@ namespace Emby.Server.Implementations.Dto
             }
 
             dto.People = list.ToArray();
+        }
+
+        /// <summary>
+        /// Retrieves cache of People for a list of items.
+        /// </summary>
+        /// <param name="items">The list of items.</param>
+        /// <param name="user">The requesting user.</param>
+        private Dictionary<Guid, List<(PersonInfo Info, Person? Entity)>> LoadPeopleForItems(
+            IEnumerable<BaseItem> items,
+            User? user = null)
+        {
+            // Ordering by person type to ensure actors and artists are at the front.
+            var itemPeopleInfo = items.Select(item => (
+                ItemId: item.Id,
+                People: _libraryManager.GetPeople(item)
+                    .OrderBy(i => i.SortOrder ?? int.MaxValue)
+                    .ThenBy(i =>
+                    {
+                        if (i.IsType(PersonKind.Actor))
+                        {
+                            return 0;
+                        }
+
+                        if (i.IsType(PersonKind.GuestStar))
+                        {
+                            return 1;
+                        }
+
+                        if (i.IsType(PersonKind.Director))
+                        {
+                            return 2;
+                        }
+
+                        if (i.IsType(PersonKind.Writer))
+                        {
+                            return 3;
+                        }
+
+                        if (i.IsType(PersonKind.Producer))
+                        {
+                            return 4;
+                        }
+
+                        if (i.IsType(PersonKind.Composer))
+                        {
+                            return 4;
+                        }
+
+                        return 10;
+                    })
+                    .ToList()
+            )).ToList();
+
+            var allPersonNames = itemPeopleInfo
+                .SelectMany(x => x.People)
+                .Select(p => p.Name)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var personEntities = allPersonNames.Select(name =>
+            {
+                try
+                {
+                    return _libraryManager.GetPerson(name);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting person {Name}", name);
+                    return null;
+                }
+            })
+            .Where(p => p is not null)
+            .Where(p => user is null || p!.IsVisible(user))
+            .DistinctBy(p => p!.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(p => p!.Name, StringComparer.OrdinalIgnoreCase)!;
+
+            return itemPeopleInfo.ToDictionary(
+                x => x.ItemId,
+                x => x.People.Select(info => (
+                    Info: info,
+                    Entity: personEntities.GetValueOrDefault(info.Name)
+                )).ToList());
         }
 
         /// <summary>

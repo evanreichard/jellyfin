@@ -38,10 +38,15 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
         // Include PeopleBaseItemMap
         if (!filter.ItemId.IsEmpty())
         {
-            dbQuery = dbQuery.Include(p => p.BaseItems!.Where(m => m.ItemId == filter.ItemId))
-                .OrderBy(e => e.BaseItems!.First(e => e.ItemId == filter.ItemId).ListOrder)
-                .ThenBy(e => e.PersonType)
-                .ThenBy(e => e.Name);
+            dbQuery = dbQuery
+                .Include(p => p.BaseItems!.Where(m => m.ItemId == filter.ItemId))
+                .SelectMany(
+                    p => p.BaseItems!.Where(m => m.ItemId == filter.ItemId),
+                    (p, m) => new { Person = p, Map = m })
+                .OrderBy(x => x.Map.ListOrder)
+                .ThenBy(x => x.Person.PersonType)
+                .ThenBy(x => x.Person.Name)
+                .Select(x => x.Person);
         }
         else
         {
@@ -86,10 +91,10 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
         using var context = _dbProvider.CreateDbContext();
         using var transaction = context.Database.BeginTransaction();
         var existingPersons = context.Peoples.Select(e => new
-            {
-                item = e,
-                SelectionKey = e.Name + "-" + e.PersonType
-            })
+        {
+            item = e,
+            SelectionKey = e.Name + "-" + e.PersonType
+        })
             .Where(p => personKeys.Contains(p.SelectionKey))
             .Select(f => f.item)
             .ToArray();
